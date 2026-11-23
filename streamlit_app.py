@@ -21,12 +21,12 @@ from xps_multicore_engine import (
     FIT_PROFILES, DEFAULT_GL_LIMITS, RECOMMENDED_MAX_PEAKS,
 )
 
-st.set_page_config(page_title='XPS Multi-Core Fitting v3 | Research PoC',page_icon='🔬',layout='wide')
+st.set_page_config(page_title="AI Agent for Automated XPS Peak Fitting",page_icon='🔬',layout='wide')
 st.markdown('''<style>
 .block-container {max-width: 1280px; padding-top: 1.7rem;}
 [data-testid="stMetricValue"] {font-size:1.3rem;}
 </style>''',unsafe_allow_html=True)
-st.title('XPS Multi-Core Fitting · v3 Research PoC')
+st.title("An AI Agent for Automated XPS Peak Fitting in Battery Research")
 st.caption('XLSX/CSV/ZIP → raw CPS → reviewed BE axis → ROI-specific iterative Shirley → product GL → nonlinear least-squares')
 st.warning('**주의:** 화합물 AI 동정과 검증된 자동 charge correction은 아직 없습니다. 자동 피크 수(BIC)는 통계적 후보일 뿐이며, 피크의 화학적 의미·ROI·FWHM·GL 값은 연구자가 검토해야 합니다.')
 
