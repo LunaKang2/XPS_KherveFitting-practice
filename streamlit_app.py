@@ -1,191 +1,203 @@
-"""Interactive F 1s fitting demo powered by the independent SciPy XPS PoC."""
-from __future__ import annotations
+"""XPS multi-core fitting research prototype: XLSX -> Shirley -> product GL -> LSQ.
 
+No inferred compound labels; no unapproved auto charge correction.
+"""
+from __future__ import annotations
+import hashlib
 import io
 import json
 import zipfile
 
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-from xps_engine import (
-    extract_zip_csv, fit_comparison, make_synthetic_f1s,
-    parse_csv, serializable_report, zip_csv_names,
-)
+from xps_excel_parser import parse_input, CORE_ORDER
+from xps_multicore_engine import fit_core, serialize_fit, RECOMMENDED_MAX_PEAKS
 
-st.set_page_config(page_title="XPS F 1s | Fitting PoC", page_icon="🔬", layout="wide")
-
-st.markdown("""
-<style>
-    .block-container { max-width: 1230px; padding-top: 2.4rem; }
-    [data-testid="stMetricValue"] { font-size: 1.45rem; }
-    .subtitle { color: #687080; font-size: 1rem; margin-top: -10px; margin-bottom: 1rem; }
-</style>
-""", unsafe_allow_html=True)
-st.title("XPS F 1s · Automated fitting PoC")
-st.markdown('<div class="subtitle">Shirley background · product GL peaks · SciPy least-squares · 1 vs 2 components</div>', unsafe_allow_html=True)
-st.info(
-    "**연구용 독립 PoC** — KherveFitting/CasaXPS의 실행 결과가 아니며, "
-    "피크 피팅만으로 화합물 존재를 확정하지 않습니다. F 1s에 맞춘 초기 피크 가정이 적용됩니다."
-)
+st.set_page_config(page_title='XPS Multi-Core Fitting | Research PoC',page_icon='🔬',layout='wide')
+st.markdown('''<style>
+.block-container {max-width: 1280px; padding-top: 1.7rem;}
+[data-testid="stMetricValue"]{font-size:1.25rem;}
+.small-note{font-size:.9rem;color:#6b7280;}
+</style>''',unsafe_allow_html=True)
+st.title('XPS Multi-Core Fitting Agent · Research PoC')
+st.caption('Excel/CSV/ZIP → Core-level detection → optional, user-approved BE adjustment → Shirley → product GL → SciPy nonlinear least-squares')
+st.warning('연구용 분석 프로토타입입니다. **화합물 자동 동정 AI는 아직 아닙니다.** 현재 버전은 BE 기준의 신뢰성을 자동으로 판정하지 않으며, 피크 개수와 성분 배정은 연구자가 검증해야 합니다.')
 
 with st.sidebar:
-    st.header("1. 데이터 업로드")
-    uploaded = st.file_uploader("F 1s CSV 또는 CSV가 들어 있는 ZIP", type=["csv", "zip"],
-                                help="CSV columns: Binding Energy (eV), Intensity (CPS)")
-    selected_name = None
-    is_demo = uploaded is None
-    if is_demo:
-        st.caption("업로드 전에는 합성(synthetic) 데모 데이터를 표시합니다. 실제 측정값이 아닙니다.")
-        selected_name = "SYNTHETIC_F1s_demo.csv"
-        raw = make_synthetic_f1s()
-    else:
-        uploaded_bytes = uploaded.getvalue()
-        if uploaded.name.lower().endswith(".zip"):
-            try:
-                available = zip_csv_names(uploaded_bytes)
-                selected_name = st.selectbox("ZIP 내부 CSV 파일 선택", options=available)
-                raw = extract_zip_csv(uploaded_bytes, selected_name)
-            except (ValueError, KeyError, zipfile.BadZipFile, RuntimeError) as exc:
-                st.error(f"ZIP 파일 처리 실패: {exc}")
-                st.stop()
-        else:
-            selected_name = uploaded.name
-            raw = uploaded_bytes
+    st.header('1 · 데이터')
+    uploaded=st.file_uploader('XPS 측정 파일 업로드',type=['xlsx','csv','zip'],help='Excel은 C1s, F1s 등 Core Level별 시트를 자동 인식. XLS(구형)는 XLSX로 변환 후 업로드.')
+    st.caption('현재 구현의 Excel 자동 인식은 Sheet 이름과 측정 BE/CPS 열을 사용합니다. 기존 Background/피팅 곡선은 raw intensity로 사용하지 않습니다.')
+if uploaded is None:
+    st.info('Core-level별 시트가 들어 있는 .xlsx 파일을 업로드하세요. 현재 LSJ-9 형식은 검증 완료되었습니다.')
+    st.stop()
 
-    st.divider()
-    st.header("2. 피팅 설정")
-    additional_offset = st.number_input(
-        "추가 BE offset (eV)", min_value=-10.0, max_value=10.0,
-        value=0.0, step=0.01, format="%.2f",
-        help="CSV에 이미 BE 보정이 포함됐다면 0으로 두세요. 여기에 입력한 값은 추가로 적용됩니다."
-    )
-    peak1 = st.number_input("첫 번째 피크 초기 중심 (eV)", value=685.10, step=0.1, format="%.2f")
-    peak2 = st.number_input("두 번째 피크 초기 중심 (eV)", value=688.50, step=0.1, format="%.2f")
-    center_window = st.slider("피크 중심 허용폭 (±eV)", min_value=0.3, max_value=3.0, value=1.5, step=0.1)
-    show_model = st.radio("그래프에 표시할 피팅 모델", ["2개 피크", "1개 피크"], horizontal=True)
-    st.caption("기본 FWHM 범위 0.6~4.0 eV · GL mixing 0~1 · Shirley baseline 고정")
+@st.cache_data(show_spinner=False)
+def read_data(raw, name):
+    return parse_input(raw,name)
 
 try:
-    x, y = parse_csv(raw)
-    x = x + float(additional_offset)
-    bg, results = fit_comparison(x, y, float(peak1), float(peak2), float(center_window))
-except (ValueError, TypeError, FloatingPointError) as exc:
-    st.error(f"데이터/피팅 설정 확인: {exc}")
-    st.stop()
+    payload=uploaded.getvalue()
+    spectra=read_data(payload,uploaded.name)
 except Exception as exc:
-    st.error(f"피팅 과정에서 오류가 발생했습니다: {type(exc).__name__}: {exc}")
-    st.stop()
+    st.error(f'파일 분석 실패: {type(exc).__name__}: {exc}');st.stop()
 
-if is_demo:
-    st.warning("현재 **합성 데모 스펙트럼**을 보고 있습니다. 실제 실험 결과가 아닙니다.")
+all_cores=list(spectra)
+fit_cores=[name for name in all_cores if name!='Survey']
+if not fit_cores:
+    st.error('피팅 가능한 Core Level을 찾지 못했습니다.');st.stop()
 
-st.caption(f"**입력:** {selected_name} · 유효 포인트 {len(x):,}개 · BE 범위 {x[0]:.2f}–{x[-1]:.2f} eV · 추가 BE offset {additional_offset:+.2f} eV")
+with st.sidebar:
+    st.divider()
+    st.header('2 · BE 보정')
+    st.success('기본값: 추가 BE correction = 0.00 eV')
+    st.caption('이미 B열로 보정된 C 1s / F 1s는 B열을 선택합니다. 다른 Core는 원본 A열을 사용하며, 보정 이력은 별도 확인해야 합니다.')
+    with st.expander('선택적 C 1s 기준 오프셋 제안 (검토 필수)'):
+        proposed=0.
+        if 'C1s' in spectra:
+            s=spectra['C1s'];candidate=float(s.x[np.argmax(s.y)])
+            proposed=284.8-candidate
+            st.write(f'C 1s 최대 강도 BE: {candidate:.2f} eV / 명목 참조: 284.80 eV')
+            st.write(f'산술적 오프셋 제안: **{proposed:+.2f} eV**')
+            st.caption('최대 강도 = C–C/C–H 성분이라는 보장이 없습니다. 이미 적용된 보정을 감안하고, 화학적 기준을 검증한 경우에만 승인하세요.')
+        approved=st.checkbox('위 C 1s 기준을 확인했고 전체 코어에 동일 오프셋을 추가 적용',value=False)
+    global_offset=proposed if approved else 0.0
+    if approved:st.warning(f'추가 글로벌 이동량 {global_offset:+.2f} eV 적용됨')
+    st.divider()
+    st.header('3 · 모델')
+    max_override=st.selectbox('최대 피크 모델 개수',options=['원소별 기본값',1,2,3,4],index=0,
+       help='P2p는 피크 개수가 아니라 doublet 그룹 개수 (최대 2).')
+    st.caption('선형결합이 아닌 product GL·고정 Shirley·ordinary least-squares. BIC가 가장 낮은 모델 선택.')
 
-quality_rows = []
-for result in results:
-    q = result["metrics"]
-    quality_rows.append({
-        "모델": f'{result["peak_count"]} peak',
-        "R²": q["r2"],
-        "RMSE (CPS)": q["rmse"],
-        "AICc ↓": q["aicc"],
-        "BIC ↓": q["bic"],
-        "최적화 성공": result["success"],
-    })
-quality = pd.DataFrame(quality_rows)
-st.subheader("모델 비교")
-st.dataframe(quality.style.format({"R²": "{:.5f}", "RMSE (CPS)": "{:,.1f}",
-                                   "AICc ↓": "{:,.1f}", "BIC ↓": "{:,.1f}"}, na_rep="—"),
-             hide_index=True, use_container_width=True)
+@st.cache_data(show_spinner=False)
+def run_fit_core(core,x_tuple,y_tuple,max_n,offset):
+    return fit_core(np.asarray(x_tuple),np.asarray(y_tuple),core,
+                    max_species=max_n,energy_offset_eV=offset)
 
-if results[0]["metrics"]["aicc"] is not None and results[1]["metrics"]["aicc"] is not None:
-    difference = results[0]["metrics"]["aicc"] - results[1]["metrics"]["aicc"]
-    st.caption(
-        f"ΔAICc (1-peak − 2-peak) = **{difference:+.2f}**. "
-        "양수면 이 조건에서 2-peak 모델의 AICc가 더 낮습니다. "
-        "이는 통계적 비교이지 화학적 피크 배정을 검증한 결과가 아닙니다."
-    )
+results={};errors={}
+with st.spinner('6개 Core Level에 대해 nonlinear least-squares fitting 중…'):
+    for core in fit_cores:
+        sp=spectra[core]
+        nmax=RECOMMENDED_MAX_PEAKS.get(core,3) if max_override=='원소별 기본값' else int(max_override)
+        if core=='P2p':nmax=min(nmax,2)
+        try:
+            results[core]=run_fit_core(core,tuple(sp.x),tuple(sp.y),nmax,round(global_offset,5))
+        except Exception as exc:
+            errors[core]=f'{type(exc).__name__}: {exc}'
 
-selected = results[0] if show_model == "1개 피크" else results[1]
-fig, (ax, axr) = plt.subplots(2, 1, figsize=(10.0, 6.9), sharex=True,
-                              gridspec_kw={"height_ratios": [3.25, 1]}, constrained_layout=True)
-ax.scatter(x, y, s=8, c="#20252c", alpha=0.62, label="Measured intensity")
-ax.plot(x, bg, lw=1.8, ls="--", c="#7f8796", label="Iterative Shirley (fixed)")
-ax.plot(x, selected["fitted"], lw=2.3, c="#187a78", label=f'{selected["peak_count"]}-peak total fit')
-for p in selected["peaks"]:
-    ax.plot(x, bg + p["component"], lw=1.5, alpha=.88, label=f'Peak {p["peak_index"]} + background')
-ax.set_ylabel("Intensity (CPS)")
-ax.legend(loc="best", fontsize=8)
-ax.grid(alpha=.15)
-axr.plot(x, selected["residual"], lw=1.25, c="#ab541e", label="Measured - fit")
-axr.axhline(0, lw=.85, c="#333333")
-axr.set_xlabel("Binding Energy (eV)")
-axr.set_ylabel("Residual (CPS)")
-axr.legend(loc="best", fontsize=8)
-axr.grid(alpha=.15)
-ax.invert_xaxis()
-st.subheader(f"{selected['peak_count']}-peak 피팅 및 residual")
-st.pyplot(fig, use_container_width=True)
-plot_data = io.BytesIO()
-fig.savefig(plot_data, dpi=180, format="png", bbox_inches="tight")
+metrics=[]
+for core in fit_cores:
+    if core not in results:
+        metrics.append({'Core':core,'N':len(spectra[core].x),'모델':'ERROR','R²':None,'RMSE':None,'BIC':None,'주의':errors[core]})
+        continue
+    r=results[core];m=r['best'];q=m['metrics']
+    metrics.append({'Core':core,'N':len(r['x']),'모델':f"{m['n_species']}개 " + ('doublet' if core=='P2p' else 'peak'),
+       'R²':q['R2'],'RMSE':q['RMSE'],'BIC':q['BIC'],
+       '주의':'; '.join(r['warnings']) or '—'})
+
+st.subheader('검출된 Core Level 및 자동 피팅 요약')
+st.caption(f'{uploaded.name} · SHA-256 {hashlib.sha256(payload).hexdigest()[:14]}… · Survey 포함 {len(all_cores)}개 시트/파일')
+st.dataframe(pd.DataFrame(metrics),hide_index=True,use_container_width=True,
+             column_config={'R²':st.column_config.NumberColumn(format='%.4f'),
+                            'RMSE':st.column_config.NumberColumn(format='%.1f'),
+                            'BIC':st.column_config.NumberColumn(format='%.1f')})
+with st.expander('BE 데이터 열 자동 선택 확인'):
+    st.dataframe(pd.DataFrame([{'Core':key,'Sheet':sp.sheet,'BE 사용 열':sp.energy_column,
+        'Intensity 사용 열':sp.intensity_column,
+        'Excel에서 감지한 사전 BE 이동 (eV)':sp.embedded_shift_eV,
+        '추가 BE 이동 (eV)':global_offset,'처리 메모':sp.note}
+        for key,sp in spectra.items()]),hide_index=True,use_container_width=True)
+
+selected=st.selectbox('자세히 분석할 Core Level',options=fit_cores)
+if selected not in results:
+    st.error(errors[selected]);st.stop()
+sp=spectra[selected];r=results[selected];best=r['best']
+st.info(sp.note)
+if r['warnings']:
+    st.warning('**자동 검증 경고:** '+' · '.join(r['warnings']))
+
+def make_figure(core,r):
+    x=r['x'];y=r['y'];best=r['best'];bg=r['background']
+    fig,(ax,axr)=plt.subplots(2,1,figsize=(10.2,7),sharex=True,
+      gridspec_kw={'height_ratios':[3.3,1]},constrained_layout=True)
+    ax.scatter(x,y,s=9,color='#263548',alpha=.68,label='Measured CPS')
+    ax.plot(x,bg,'--',c='#7e8793',lw=1.7,label='Iterative Shirley (fixed)')
+    ax.plot(x,best['fit'],c='#126e69',lw=2.4,label='Total GL fit')
+    colors=['#ad5b30','#3a65a9','#a3479b','#777f19','#6b46a2']
+    for i,p in enumerate(best['peaks']):
+        ax.plot(x,bg+p['curve'],lw=1.45,alpha=.9,
+                color=colors[(i//2 if core=='P2p' else i)%len(colors)],
+                label=f"{p['label']} {p['center_eV']:.2f} eV")
+    ax.grid(alpha=.15);ax.legend(fontsize=8,ncol=2)
+    ax.set_ylabel('Intensity (CPS)')
+    axr.plot(x,best['residual'],c='#a74827',lw=1.1)
+    axr.axhline(0,color='#2d3748',lw=.8);axr.grid(alpha=.15)
+    axr.set_ylabel('Residual');axr.set_xlabel('Binding Energy (eV)')
+    ax.invert_xaxis();ax.set_title(f"{core} | Shirley + product GL | {best['model_kind']}")
+    return fig
+
+fig=make_figure(selected,r)
+st.pyplot(fig,use_container_width=True)
 plt.close(fig)
 
-peak_rows = []
-for p in selected["peaks"]:
-    peak_rows.append({
-        "피크": p["peak_index"], "중심 BE (eV)": p["center_eV"],
-        "FWHM (eV)": p["fwhm_eV"], "높이 (CPS)": p["height_CPS"],
-        "GL Lorentz fraction": p["mix"], "Area (CPS·eV)": p["area_CPS_eV_in_window"],
-    })
-st.subheader("선택 모델의 피크 파라미터")
-st.dataframe(pd.DataFrame(peak_rows).style.format({
-    "중심 BE (eV)": "{:.3f}", "FWHM (eV)": "{:.3f}",
-    "높이 (CPS)": "{:,.0f}", "GL Lorentz fraction": "{:.3f}",
-    "Area (CPS·eV)": "{:,.1f}",
-}), hide_index=True, use_container_width=True)
+q=pd.DataFrame([{'모델':m['model_kind'],'구성종 수':m['n_species'],'피크 수':m['n_components'],
+    'R²':m['metrics']['R2'],'RMSE (CPS)':m['metrics']['RMSE'],
+    'AICc':m['metrics']['AICc'],'BIC':m['metrics']['BIC'],'수렴':m['optimizer_success'],
+    '경계 도달':m['near_bound']} for m in r['candidates']])
+st.markdown('#### 피크 개수별 모델 비교')
+st.dataframe(q.style.format({'R²':'{:.5f}','RMSE (CPS)':'{:,.1f}','AICc':'{:,.1f}','BIC':'{:,.1f}'},na_rep='—'),
+             hide_index=True,use_container_width=True)
+peak_rows=[{k:v for k,v in p.items() if k!='curve'} for p in best['peaks']]
+st.markdown('#### 선택 모델의 피크 파라미터')
+st.dataframe(pd.DataFrame(peak_rows),hide_index=True,use_container_width=True)
 
-if not all(r["success"] for r in results):
-    st.warning("하나 이상의 모델에서 optimizer가 수렴 성공을 보고하지 않았습니다. 결과를 검토하세요.")
-if any(r["near_any_bound"] for r in results):
-    st.warning("하나 이상의 파라미터가 설정된 경계값에 가까워 결과가 제약조건에 민감할 수 있습니다.")
+st.markdown('#### 분석 결과 다운로드')
 
-report = serializable_report(x, y, selected_name, raw, float(additional_offset),
-                             float(peak1), float(peak2), float(center_window), results)
-export_rows = []
-for r in results:
-    for p in r["peaks"]:
-        export_rows.append({
-            "peak_count": r["peak_count"], "r2": r["metrics"]["r2"],
-            "rmse_CPS": r["metrics"]["rmse"], "aicc": r["metrics"]["aicc"],
-            "bic": r["metrics"]["bic"], "peak_index": p["peak_index"],
-            "center_eV": p["center_eV"], "fwhm_eV": p["fwhm_eV"],
-            "height_CPS": p["height_CPS"], "mix": p["mix"],
-            "area_CPS_eV_in_window": p["area_CPS_eV_in_window"],
-        })
-st.subheader("결과 다운로드")
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.download_button("피팅 결과 JSON", data=json.dumps(report, ensure_ascii=False, indent=2),
-                       file_name="F1s_fit_results.json", mime="application/json", use_container_width=True)
-with c2:
-    st.download_button("피크 요약 CSV", data=pd.DataFrame(export_rows).to_csv(index=False).encode("utf-8-sig"),
-                       file_name="F1s_fit_summary.csv", mime="text/csv", use_container_width=True)
-with c3:
-    st.download_button("그래프 PNG", data=plot_data.getvalue(),
-                       file_name="F1s_model_comparison.png", mime="image/png", use_container_width=True)
+def pack_all():
+    archive=io.BytesIO()
+    report={'source_file':uploaded.name,'sha256':hashlib.sha256(payload).hexdigest(),
+      'energy_policy':'Use user-adjusted B column when consistent shifted series; otherwise A. NO new correction by default.',
+      'user_approved_global_offset_eV':global_offset,
+      'spectra':{},'errors':errors}
+    all_peaks=[];all_models=[]
+    with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
+        for name,sp in spectra.items():
+            report['spectra'][name]={'sheet':sp.sheet,'n_points':len(sp.x),'energy_column':sp.energy_column,
+              'intensity_column':sp.intensity_column,'embedded_BE_shift_eV':sp.embedded_shift_eV,
+              'note':sp.note}
+            if name not in results: continue
+            rr=results[name]
+            report['spectra'][name]['fit']=serialize_fit(rr)
+            m=rr['best']
+            for p in m['peaks']:
+                all_peaks.append({'core':name,**{k:v for k,v in p.items() if k!='curve'}})
+            for c in rr['candidates']:
+                all_models.append({'core':name,'peak_count':c['n_components'],'n_species':c['n_species'],
+                  'model_kind':c['model_kind'],**c['metrics'],
+                  'optimizer_success':c['optimizer_success'],'near_bound':c['near_bound']})
+            curves=pd.DataFrame({'BE_eV':rr['x'],'measured_CPS':rr['y'],
+                 'shirley_CPS':rr['background'],'fit_CPS':m['fit'],'residual_CPS':m['residual']})
+            z.writestr(f'{name}/fitted_curve.csv',curves.to_csv(index=False))
+            fig=make_figure(name,rr); png=io.BytesIO();fig.savefig(png,format='png',dpi=170)
+            plt.close(fig);z.writestr(f'{name}/fit.png',png.getvalue())
+        z.writestr('fit_report.json',json.dumps(report,indent=2,ensure_ascii=False))
+        z.writestr('all_peaks.csv',pd.DataFrame(all_peaks).to_csv(index=False))
+        z.writestr('all_models.csv',pd.DataFrame(all_models).to_csv(index=False))
+    return archive.getvalue()
 
-with st.expander("피팅 방법 · 과학적 해석 유의사항"):
-    st.markdown("""
-- **입력값:** 업로드한 CSV의 BE 및 CPS. BE offset이 0이면 원래 파일에 있는 보정값만 사용합니다.
-- **배경:** 양 끝 5개 신호값의 중앙값을 경계값으로 쓰는 원본 PoC의 반복형 Shirley 근사. 전 구간에서 사전 계산한 배경을 피팅하는 동안 고정합니다.
-- **모델:** 높이 정규화된 product GL; Gaussian/Lorentzian 기여율은 0–1 사이에서 최적화합니다. KherveFitting의 GL과 수치적으로 같다는 보장은 없습니다.
-- **피팅:** 비선형 least-squares. 중심 위치는 사용자 초기값 ±허용폭, FWHM 0.6–4.0 eV. 피크 수는 1개/2개만 비교합니다.
-- **평가지표:** R², RMSE, AICc, BIC. AICc/BIC는 **고정 배경**과 잔차의 독립·동분산 가정을 전제로 한 비교이며, 배경 불확실성을 포함하지 않습니다.
-- **Peak area:** 측정된 **BE 범위 안에서만 적분**한 GL 성분 면적입니다. 절대 농도나 원소 조성비를 의미하지 않습니다.
-- **화학적 배정:** F 1s 하나만으로 화합물을 확정하지 마세요. C 1s, O 1s, P 2p, Li 1s 등의 피크와 측정 조건, charge correction, 외부 레퍼런스를 함께 검토해야 합니다.
-- **데이터 보안:** 실험 데이터를 제3자 클라우드에 올리기 전에 연구실의 데이터 공개 정책을 확인하세요.
-""")
+st.download_button('모든 Core Level 결과 (PNG/CSV/JSON) ZIP 다운로드',data=pack_all(),
+                   file_name='XPS_multicore_fit_results.zip',mime='application/zip',use_container_width=True)
+with st.expander('한계 및 후속 검증'):
+    st.markdown('''
+- **이미 처리한 BE를 다시 보정하지 않습니다.** B열의 일정 이동은 Excel에 이미 존재하는 이동량이며, 분석 엔진의 추가 이동량과 구분합니다.
+- **추론이 아니라 수치 피팅입니다.** 모델의 BIC 최솟값이 화학적 성분 수를 확정하지 않습니다.
+- **고정 Shirley**: 피팅 전에 만든 background는 최적화 동안 고정됩니다. BE 범위/끝점 선택과 측정된 배경에 따라 달라질 수 있습니다.
+- **GL**: 원본 연구 PoC의 product GL 근사이며, KherveFitting/CasaXPS와 정확히 같지 않을 수 있습니다.
+- **P 2p**: 0.86 eV 분리, 2:1 면적비, 같은 FWHM/GL을 가정하는 doublet 모델. 장비·시료에 맞게 검증해야 합니다.
+- **Uncertainty**: 데이터 반복 측정, 잔차 구조, 변수 상관관계, 조건별 교차검증 없이 자동 화합물 동정이나 정량 분석에 사용하지 마세요.
+- **기밀 데이터**: Streamlit Cloud 업로드 전에 연구실 데이터 공개 정책 확인.
+''')
